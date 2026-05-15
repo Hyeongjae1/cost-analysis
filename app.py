@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import html as html_module
 import os
 import re
 import sys
@@ -363,15 +364,41 @@ def wise_streamlit_css() -> str:
   .stApp {
     background: var(--w-canvas-soft) !important;
   }
+  .app-title-top-spacer {
+    display: block;
+    height: 12px;
+    width: 100%;
+  }
+  section[data-testid="stMain"] {
+    padding-top: 0.85rem !important;
+  }
+  section[data-testid="stMain"] > div {
+    padding-top: 0 !important;
+  }
   .block-container {
-    padding-top: 0.75rem !important;
+    padding-top: 3.5rem !important;
     max-width: 100% !important;
+  }
+  section.main > div {
+    scroll-padding-top: 0.5rem;
   }
   h1, [data-testid="stHeader"] { color: var(--w-ink) !important; }
   h1 {
     font-weight: 900 !important;
     font-size: clamp(1.5rem, 2.2vw, 2rem) !important;
     letter-spacing: -0.02em !important;
+    line-height: 1.38 !important;
+    padding-top: 0.65rem !important;
+    padding-bottom: 0.2rem !important;
+    margin-top: 0.3rem !important;
+    margin-bottom: 0.35rem !important;
+    overflow: visible !important;
+  }
+  section[data-testid="stMain"] [data-testid="element-container"] {
+    overflow: visible !important;
+  }
+  div[data-testid="stVerticalBlockBorderWrapper"] {
+    overflow: visible !important;
   }
   h2, h3 { font-weight: 700 !important; color: var(--w-ink) !important; }
   [data-testid="stCaption"], .stCaption { color: var(--w-mute) !important; }
@@ -833,6 +860,7 @@ def answer_from_pl_data(df: pd.DataFrame, question: str) -> str:
 
 
 def render_top_nav() -> None:
+    st.markdown('<div class="app-title-top-spacer" aria-hidden="true"></div>', unsafe_allow_html=True)
     st.title("손익분석 시스템")
     c1, c2, _ = st.columns([1, 1, 4])
     with c1:
@@ -1012,6 +1040,95 @@ def factory_dashboard(df: pd.DataFrame) -> None:
         st.rerun()
 
 
+def year_label_short(y: int) -> str:
+    """연도 표기용 뒤 두 자리 (예: 2025 → '25)."""
+    return f"'{y % 100:02d}"
+
+
+def customer_sales_sparkline_svg(
+    sales_eok: list[float],
+    profits_won: list[float],
+    five_years: list[int],
+    y_last: int,
+    w: int = 132,
+    h: int = 36,
+) -> str:
+    """5개년 매출 막대(행 내 상대 높이). 흑자: 하늘색·최종연 짙은 푸른색 / 적자: 옅은 빨강·최종연 빨간색."""
+    if len(sales_eok) != len(five_years) or not five_years:
+        return ""
+    mx = max(sales_eok) if max(sales_eok) > 0 else 1.0
+    n = len(five_years)
+    gap = 2.0
+    pad = 3.0
+    band = (w - 2 * pad) / n
+    bw = max(2.0, band - gap)
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+        f'viewBox="0 0 {w} {h}" role="img" aria-label="연도별 매출">'
+    ]
+    for i, y in enumerate(five_years):
+        sv = float(sales_eok[i])
+        raw_p = profits_won[i]
+        try:
+            pv = float(raw_p)
+        except (TypeError, ValueError):
+            pv = 0.0
+        if pd.isna(raw_p):
+            pv = 0.0
+        profit = pv >= 0.0
+        is_last = y == y_last
+        if profit:
+            fill = "#1e40af" if is_last else "#7dd3fc"
+        else:
+            fill = "#dc2626" if is_last else "#fca5a5"
+        h_bar = max(3.0, (sv / mx) * (h - 2 * pad))
+        x0 = pad + i * band + gap / 2
+        y0 = h - pad - h_bar
+        parts.append(
+            f'<rect x="{x0:.2f}" y="{y0:.2f}" width="{bw:.2f}" height="{h_bar:.2f}" '
+            f'rx="3" ry="3" fill="{fill}"/>'
+        )
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def customer_compact_table_html(rows: list[dict], y_start: int, y_last: int) -> str:
+    """고객 목록 5열 HTML (스파크라인 SVG 포함)."""
+    thead = (
+        "<thead><tr>"
+        "<th>고객사</th>"
+        f"<th>5년 매출<br/><span class='sub'>({y_start % 100:02d}년→{y_last % 100:02d}년 매출, 억)</span></th>"
+        f"<th>연도별 매출추이<br/><span class='sub'>({year_label_short(y_start)}-{year_label_short(y_last)})</span></th>"
+        f"<th>{year_label_short(y_last)} 영업이익<br/><span class='sub'>(억)</span></th>"
+        f"<th>{year_label_short(y_last)} OPM<br/><span class='sub'>(%)</span></th>"
+        "</tr></thead>"
+    )
+    body_parts: list[str] = []
+    for r in rows:
+        body_parts.append(
+            "<tr>"
+            f"<td class='name'>{html_module.escape(str(r['고객사']))}</td>"
+            f"<td class='num'>{html_module.escape(r['매출_텍스트'])}</td>"
+            f"<td class='spark'>{r['svg']}</td>"
+            f"<td class='num'>{html_module.escape(r['이익_텍스트'])}</td>"
+            f"<td class='num'>{html_module.escape(r['opm_텍스트'])}</td>"
+            "</tr>"
+        )
+    style = (
+        "<style>"
+        ".cust-t{width:100%;border-collapse:collapse;font-size:14px;margin:0.25rem 0 0.75rem;}"
+        ".cust-t th,.cust-t td{border-bottom:1px solid rgba(14,15,12,0.1);padding:8px 10px;vertical-align:middle;}"
+        ".cust-t th{text-align:right;font-weight:600;color:#0e0f0c;background:rgba(255,255,255,0.65);}"
+        ".cust-t th:first-child,.cust-t td:first-child{text-align:left;}"
+        ".cust-t .sub{font-weight:400;font-size:11px;color:#454745;}"
+        ".cust-t .name{font-weight:600;}"
+        ".cust-t .num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;}"
+        ".cust-t .spark{text-align:center;width:150px;}"
+        "</style>"
+    )
+    return f"{style}<table class='cust-t'>{thead}<tbody>{''.join(body_parts)}</tbody></table>"
+
+
 def customer_dashboard(df: pd.DataFrame) -> None:
     st.subheader("고객별 손익")
 
@@ -1043,45 +1160,59 @@ def customer_dashboard(df: pd.DataFrame) -> None:
     col_last_rev = f"{y_last}_매출액"
     list_df = list_df.sort_values(col_last_rev, ascending=False).reset_index(drop=True)
 
-    disp_full = pd.DataFrame({CUSTOMER_COL: list_df[CUSTOMER_COL]})
-    for y in years:
-        disp_full[f"{y}년 매출(억)"] = (list_df[f"{y}_매출액"].astype(float) / EOK).round(2)
-        disp_full[f"{y}년 영업이익(억)"] = (list_df[f"{y}_영업이익"].astype(float) / EOK).round(2)
-        disp_full[f"{y}년 영업이익율(%)"] = format_margin_pct(list_df[f"{y}_영업이익율"])
+    y_start = y_last - 4
+    five_years = list(range(y_start, y_last + 1))
+
+    display_rows: list[dict] = []
+    for _, crow in list_df.iterrows():
+        sales_eok: list[float] = []
+        profits_won: list[float] = []
+        for y in five_years:
+            sc = f"{y}_매출액"
+            pc = f"{y}_영업이익"
+            raw_s = crow[sc] if sc in crow.index else 0
+            raw_p = crow[pc] if pc in crow.index else 0
+            sv = pd.to_numeric(raw_s, errors="coerce")
+            pv = pd.to_numeric(raw_p, errors="coerce")
+            sales_eok.append(float(sv) / EOK if pd.notna(sv) else 0.0)
+            profits_won.append(float(pv) if pd.notna(pv) else 0.0)
+        mcol = f"{y_last}_영업이익율"
+        raw_m = crow[mcol] if mcol in crow.index else pd.NA
+        if pd.isna(raw_m):
+            opm_txt = "—"
+        else:
+            opm_txt = f"{float(raw_m) * 100:.2f}%"
+        last_p = crow[f"{y_last}_영업이익"] if f"{y_last}_영업이익" in crow.index else 0
+        last_p_eok = float(pd.to_numeric(last_p, errors="coerce") or 0) / EOK
+        display_rows.append(
+            {
+                "고객사": crow[CUSTOMER_COL],
+                "매출_텍스트": f"{sales_eok[0]:.2f} -> {sales_eok[-1]:.2f}",
+                "svg": customer_sales_sparkline_svg(sales_eok, profits_won, five_years, y_last),
+                "이익_텍스트": f"{last_p_eok:.2f}",
+                "opm_텍스트": opm_txt,
+            }
+        )
 
     st.markdown(f"**고객사 목록 ({y_last}년 매출액 기준 내림차순, {years[0]}~{y_last}년)**")
-    st.caption("금액: 억 원 / 이익율: % — 아래 그래프는 각 매출처의 연도별 추이입니다. 품목별 상세는 표에서 행을 선택하세요.")
-    df_state = st.dataframe(
-        disp_full,
-        use_container_width=True,
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row",
-        key="customer_list_sf",
+    st.caption(
+        f"「5년 매출」: {y_start % 100:02d}년 매출액(억) → {y_last % 100:02d}년 매출액(억). "
+        "「연도별 매출추이」: 막대 높이는 해당 고객의 5개년 매출 비율입니다. "
+        "영업이익 **흑자** 연도는 하늘색(맨 오른쪽·최신 연도만 짙은 푸른색), **적자** 연도는 옅은 빨강(최신 연도만 빨간색)입니다."
     )
-    pick_r = dataframe_selection_rows(df_state, "customer_list_sf")
-    sel: str | None = None
-    if pick_r:
-        sel = str(disp_full.iloc[int(pick_r[0])][CUSTOMER_COL])
+    st.markdown(customer_compact_table_html(display_rows, y_start, y_last), unsafe_allow_html=True)
 
-    st.markdown("**고객별 연도별 매출·영업이익(막대) 및 영업이익율(꺾은선)**")
-    ncols = 4
-    cust_list = list_df[CUSTOMER_COL].tolist()
-    for r0 in range(0, len(cust_list), ncols):
-        chunk = cust_list[r0 : r0 + ncols]
-        cols = st.columns(len(chunk))
-        for ci, cname in enumerate(chunk):
-            cy = g[g[CUSTOMER_COL] == cname][[YEAR_COL, "매출액", "영업이익"]].sort_values(YEAR_COL)
-            with cols[ci]:
-                st.plotly_chart(
-                    profit_loss_figure(cy, str(cname), height=260),
-                    use_container_width=True,
-                    key=f"pl_cust_grid_{r0}_{ci}",
-                )
-
-    if sel is None:
-        st.info("품목별 상세를 보려면 위 **고객사 목록** 표에서 매출처 한 줄을 선택해 주세요.")
+    cust_options = list_df[CUSTOMER_COL].astype(str).tolist()
+    if not cust_options:
+        st.warning("매출처 데이터가 없습니다.")
         return
+
+    sel = st.selectbox(
+        "연도별·품목별 상세를 표시할 매출처",
+        options=cust_options,
+        index=0,
+        key="customer_detail_pick",
+    )
 
     st.divider()
     st.markdown(f"**선택: `{sel}`**")

@@ -6,3 +6,7 @@ backgroundColor = "#e8ebe6"
 secondaryBackgroundColor = "#ffffff"
 textColor = "#0e0f0c"
 font = "sans serif"
+
+# 상단 제목이 헤더·툴바에 가리지 않도록 최소 UI
+[client]
+toolbarMode = "minimal"
