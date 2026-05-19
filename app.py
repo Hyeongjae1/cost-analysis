@@ -1,6 +1,6 @@
 """
 손익분석 시스템 — Streamlit 대시보드
-데이터: profit_loss_analysis_data.xlsx (시트: 손익데이터)
+데이터: AI단기과제_더미데이터.xlsx (매출-원가자료 + 품목별제조원가) 또는 레거시 손익데이터 시트
 """
 
 from __future__ import annotations
@@ -14,10 +14,15 @@ from pathlib import Path
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
-DATA_PATH = Path(__file__).resolve().parent / "profit_loss_analysis_data.xlsx"
-SHEET_NAME = "손익데이터"
+from data_loader import load_pl_dataframe, resolve_data_path
+
+DATA_PATH = resolve_data_path()
 EOK = 100_000_000  # 억 원 환산
+M_WON = 1_000_000  # 백만 원(M) 표시
+VARIABLE_COST_COLS = ["재료비", "노무비", "경비", "용기상각비"]
+MFG_COST_COLS = ["재료비", "노무비", "경비"]
 
 YEAR_COL = "연도"
 FACTORY_COL = "공장"
@@ -41,7 +46,7 @@ WISE_PLOT_COLORWAY = (
 )
 
 # 공장별 탭: 상단 차트·선택 표 행 순서 (매출과 무관)
-FACTORY_TAB_ORDER: tuple[str, ...] = ("공장A", "공장B", "공장C")
+FACTORY_TAB_ORDER: tuple[str, ...] = ("M30", "M10", "M20")
 
 
 def factories_for_factory_tab(names) -> list[str]:
@@ -292,6 +297,12 @@ def init_session_state() -> None:
         "f_factory": None,
         "f_item": None,
         "chat_messages": [],
+        "filters_applied": False,
+        "flt_year": None,
+        "flt_factories": None,
+        "flt_customers": None,
+        "flt_items": None,
+        "watch_detail_open": False,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -299,14 +310,272 @@ def init_session_state() -> None:
 
 
 def load_raw_data() -> pd.DataFrame:
-    df = pd.read_excel(DATA_PATH, sheet_name=SHEET_NAME)
-    df[YEAR_COL] = pd.to_numeric(df[YEAR_COL], errors="coerce").astype("Int64")
-    return df
+    return load_pl_dataframe(DATA_PATH)
 
 
 @st.cache_data(show_spinner=False)
 def cached_data() -> pd.DataFrame:
     return load_raw_data()
+
+
+def with_contribution(df: pd.DataFrame) -> pd.DataFrame:
+    """공헌이익 = 매출액 − 변동원가(재료·노무·경비·용기상각)."""
+    out = df.copy()
+    var_cost = out[VARIABLE_COST_COLS].sum(axis=1, numeric_only=True)
+    out["공헌이익"] = out["매출액"] - var_cost
+    out["공헌이익률"] = out["공헌이익"] / out["매출액"].replace(0, pd.NA)
+    return out
+
+
+def apply_global_filters(
+    df: pd.DataFrame,
+    year: int | None,
+    factories: list[str] | None,
+    customers: list[str] | None,
+    items: list[str] | None,
+) -> pd.DataFrame:
+    """연도·공장·고객·품목 필터를 동시에 적용(AND)."""
+    out = df
+    if year is not None:
+        out = out[out[YEAR_COL].astype(int) == year]
+    if factories:
+        out = out[out[FACTORY_COL].astype(str).isin(factories)]
+    if customers:
+        out = out[out[CUSTOMER_COL].astype(str).isin(customers)]
+    if items:
+        out = out[out[ITEM_COL].astype(str).isin(items)]
+    return out
+
+
+def apply_scope_filters(
+    df: pd.DataFrame,
+    factories: list[str] | None,
+    customers: list[str] | None,
+    items: list[str] | None,
+) -> pd.DataFrame:
+    """연도 제외 — 추이 차트용."""
+    return apply_global_filters(df, None, factories, customers, items)
+
+
+def _sanitize_multiselect(selected: list[str] | None, options: list[str]) -> list[str]:
+    if not selected:
+        return []
+    opt_set = set(options)
+    return [x for x in selected if x in opt_set]
+
+
+def filter_factory_options(df: pd.DataFrame, year: int) -> list[str]:
+    scoped = apply_global_filters(df, year, None, None, None)
+    return factories_for_factory_tab(scoped[FACTORY_COL].dropna().unique())
+
+
+def filter_customer_options(
+    df: pd.DataFrame,
+    year: int,
+    factories: list[str] | None,
+) -> list[str]:
+    scoped = apply_global_filters(df, year, factories, None, None)
+    return sorted(scoped[CUSTOMER_COL].dropna().astype(str).unique().tolist())
+
+
+def filter_item_options(
+    df: pd.DataFrame,
+    year: int,
+    factories: list[str] | None,
+    customers: list[str] | None,
+) -> list[str]:
+    scoped = apply_global_filters(df, year, factories, customers, None)
+    return sorted(scoped[ITEM_COL].dropna().astype(str).unique().tolist())
+
+
+def inject_multiselect_autoclose_js() -> None:
+    """멀티셀렉트·셀렉트: 마우스가 팝오버를 벗어나면 닫힘."""
+    components.html(
+        """
+<script>
+(function () {
+  const root = window.parent.document;
+  if (!root || root._plFilterAutoClose) return;
+  root._plFilterAutoClose = true;
+
+  const blurInputs = () => {
+    root.querySelectorAll('[data-testid="stMultiSelect"] input, [data-testid="stSelectbox"] input')
+      .forEach((el) => { try { el.blur(); } catch (e) {} });
+  };
+
+  const bindPopover = (pop) => {
+    if (!pop || pop.dataset.plAutoClose) return;
+    pop.dataset.plAutoClose = "1";
+    pop.addEventListener("mouseleave", () => {
+      setTimeout(() => {
+        if (!pop.matches(":hover")) blurInputs();
+      }, 120);
+    });
+  };
+
+  const scan = () => root.querySelectorAll('[data-baseweb="popover"]').forEach(bindPopover);
+
+  const obs = new MutationObserver(scan);
+  obs.observe(root.body, { childList: true, subtree: true });
+  scan();
+
+  const wrap = root.querySelector(".filter-col-wrap");
+  if (wrap) {
+    wrap.addEventListener("mouseleave", (ev) => {
+      if (!wrap.contains(ev.relatedTarget)) setTimeout(blurInputs, 80);
+    });
+  }
+})();
+</script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def fmt_eok(value: float) -> str:
+    """억 원 단위 숫자 문자열 (기호 없음)."""
+    return f"{value / EOK:,.2f}"
+
+
+def trend_year_bounds(year: int, data_min_year: int = 2021) -> tuple[int, int]:
+    """기준연도 포함 최근 5개년 (데이터 시작 연도 미만으로는 내려가지 않음)."""
+    y_end = int(year)
+    y_start = max(data_min_year, y_end - 4)
+    return y_start, y_end
+
+
+def trend_year_label(y_start: int, y_end: int) -> str:
+    return f"{y_start}년~{y_end}년"
+
+
+def yoy_pct(curr: float, prev: float) -> float | None:
+    if prev == 0:
+        return None
+    return (curr - prev) / abs(prev) * 100.0
+
+
+def kpi_delta_html(pct: float | None, *, unit: str = "%", invert: bool = False) -> str:
+    if pct is None:
+        return "<span class='kpi-delta neutral'>—</span>"
+    good = pct >= 0 if not invert else pct <= 0
+    cls = "up" if good else "down"
+    arrow = "▲" if pct >= 0 else "▼"
+    return f"<span class='kpi-delta {cls}'>{arrow} {abs(pct):.1f}{unit} YoY</span>"
+
+
+def aggregate_year_metrics(df: pd.DataFrame, year: int) -> dict[str, float]:
+    sub = df[df[YEAR_COL].astype(int) == year]
+    sales = float(sub["매출액"].sum())
+    contrib = float(sub["공헌이익"].sum())
+    qty = float(sub["매출수량"].sum())
+    mfg = float(sub[MFG_COST_COLS].sum(axis=1).sum())
+    margin = (contrib / sales * 100.0) if sales else 0.0
+    unit_mfg = (mfg / qty) if qty > 0 else 0.0
+    op_profit = float(sub["영업이익"].sum())
+    op_margin = (op_profit / sales * 100.0) if sales else 0.0
+    return {
+        "매출액": sales,
+        "공헌이익": contrib,
+        "공헌이익률": margin,
+        "영업이익": op_profit,
+        "영업이익률": op_margin,
+        "단위제조원가": unit_mfg,
+    }
+
+
+def _watch_item_groups(df: pd.DataFrame, year: int) -> pd.DataFrame:
+    """품목·고객사 단위 집계 (요주의 품목 판별용)."""
+    sub = df[df[YEAR_COL].astype(int) == year]
+    if sub.empty:
+        return pd.DataFrame()
+    g = sub.groupby([ITEM_COL, CUSTOMER_COL], as_index=False).agg(
+        매출수량=("매출수량", "sum"),
+        매출액=("매출액", "sum"),
+        영업이익=("영업이익", "sum"),
+    )
+    g["영업이익율"] = (g["영업이익"] / g["매출액"].replace(0, pd.NA)).astype(float)
+    return g
+
+
+def count_watch_items(df: pd.DataFrame, year: int) -> int:
+    g = _watch_item_groups(df, year)
+    if g.empty:
+        return 0
+    bad = (g["영업이익"] < 0) | (g["영업이익율"] < 0.05)
+    return int(bad.sum())
+
+
+def watch_item_detail_rows(df: pd.DataFrame, year: int) -> pd.DataFrame:
+    g = _watch_item_groups(df, year)
+    if g.empty:
+        return g
+    bad = (g["영업이익"] < 0) | (g["영업이익율"] < 0.05)
+    out = g.loc[bad].copy()
+    out["품목"] = out[ITEM_COL].astype(str)
+    out["고객사"] = out[CUSTOMER_COL].astype(str)
+    out["매출액(억)"] = (out["매출액"] / EOK).round(2)
+    out["영업이익(억)"] = (out["영업이익"] / EOK).round(2)
+    out["영업이익율(%)"] = (out["영업이익율"] * 100).round(2)
+    return out.sort_values("매출액", ascending=False)[
+        ["품목", "고객사", "매출수량", "매출액(억)", "영업이익(억)", "영업이익율(%)"]
+    ]
+
+
+def detect_anomalies(df: pd.DataFrame) -> list[str]:
+    """공장별 재료비 전년 대비 급등(15%+) 감지."""
+    alerts: list[str] = []
+    years = sorted(df[YEAR_COL].dropna().astype(int).unique().tolist())
+    if len(years) < 2:
+        return alerts
+    y_curr, y_prev = years[-1], years[-2]
+    for fac in sorted(df[FACTORY_COL].dropna().astype(str).unique()):
+        c = df[(df[FACTORY_COL] == fac) & (df[YEAR_COL] == y_curr)]["재료비"].sum()
+        p = df[(df[FACTORY_COL] == fac) & (df[YEAR_COL] == y_prev)]["재료비"].sum()
+        pct = yoy_pct(float(c), float(p))
+        if pct is not None and pct >= 15.0:
+            alerts.append(f"{fac} 공장 원자재비 전년비 {pct:.0f}% 상승 감지")
+    return alerts[:3]
+
+
+def revenue_contribution_figure(by_year: pd.DataFrame, title: str) -> go.Figure:
+    """매출(막대, 억 원) + 공헌이익률(꺾은선)."""
+    by_year = by_year.sort_values(YEAR_COL).copy()
+    x = by_year[YEAR_COL].astype(int).tolist()
+    sales_eok = (by_year["매출액"].astype(float) / EOK).round(2)
+    margin = (by_year["공헌이익"].astype(float) / by_year["매출액"].replace(0, pd.NA) * 100).round(1)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            name="매출액",
+            x=x,
+            y=sales_eok,
+            marker_color="#3b82f6",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            name="공헌이익률(%)",
+            x=x,
+            y=margin,
+            yaxis="y2",
+            mode="lines+markers",
+            line=dict(color="#ef4444", width=2.5),
+            marker=dict(size=7),
+        )
+    )
+    fig.update_layout(
+        title=title,
+        height=380,
+        margin=dict(t=48, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="right", x=1),
+        yaxis=dict(title="매출액 (억 원)", gridcolor="rgba(14,15,12,0.08)"),
+        yaxis2=dict(title="공헌이익률 (%)", overlaying="y", side="right", showgrid=False),
+        xaxis=dict(title="연도", tickmode="linear", dtick=1),
+        **wise_plotly_layout(),
+    )
+    return fig
 
 
 def df_to_eok_display(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
@@ -365,9 +634,7 @@ def wise_streamlit_css() -> str:
     background: var(--w-canvas-soft) !important;
   }
   .app-title-top-spacer {
-    display: block;
-    height: 12px;
-    width: 100%;
+    display: none;
   }
   section[data-testid="stMain"] {
     padding-top: 0.85rem !important;
@@ -458,6 +725,232 @@ def wise_streamlit_css() -> str:
     border-radius: var(--w-radius-xl) !important;
   }
   iframe[title="streamlit_plotly_chart"] { border-radius: var(--w-radius-md); }
+  .filter-panel {
+    background: transparent;
+    border: none;
+    padding: 0;
+  }
+  .filter-col-wrap [data-testid="stVerticalBlockBorderWrapper"] {
+    background: var(--w-canvas-soft) !important;
+    border: none !important;
+    box-shadow: none !important;
+  }
+  .filter-col-wrap [data-testid="stVerticalBlock"] {
+    background: var(--w-canvas-soft) !important;
+  }
+  .filter-panel h4 {
+    margin: 0 0 0.75rem 0;
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--w-ink);
+  }
+  .filter-panel label, .filter-panel p {
+    font-size: 0.72rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.04em;
+    color: var(--w-mute) !important;
+    text-transform: uppercase;
+  }
+  .anomaly-box {
+    background: #fffbeb;
+    border: 1px solid #fcd34d;
+    border-radius: var(--w-radius-sm);
+    padding: 0.65rem 0.75rem;
+    font-size: 0.82rem;
+    color: #92400e;
+    margin-top: 0.75rem;
+  }
+  .kpi-card {
+    background: linear-gradient(135deg, #1e3a5f 0%, #2563eb 100%);
+    color: #fff;
+    border-radius: var(--w-radius-md);
+    padding: 1rem 1.1rem;
+    min-height: 108px;
+  }
+  .kpi-card.light {
+    background: var(--w-canvas);
+    color: var(--w-ink);
+    border: 1px solid color-mix(in srgb, var(--w-ink) 10%, transparent);
+  }
+  .kpi-card.green {
+    background: linear-gradient(135deg, #6d9f7c 0%, #9fd4a8 48%, #e4f7d6 100%);
+    color: #0e0f0c;
+    border: 1px solid color-mix(in srgb, #4a7c59 22%, transparent);
+  }
+  .kpi-card.green .kpi-label { opacity: 0.88; }
+  .kpi-card.green .kpi-delta.up { color: #166534; }
+  .kpi-card.green .kpi-delta.down { color: #b91c1c; }
+  .kpi-card.warn {
+    background: #fef2f2;
+    color: #991b1b;
+    border: 1px solid #fecaca;
+  }
+  .kpi-card .kpi-label {
+    font-size: 0.78rem;
+    font-weight: 600;
+    opacity: 0.9;
+    margin-bottom: 0.35rem;
+  }
+  .kpi-card .kpi-value {
+    font-size: 1.55rem;
+    font-weight: 800;
+    line-height: 1.2;
+    letter-spacing: -0.02em;
+  }
+  .kpi-card .kpi-sub {
+    font-size: 0.75rem;
+    margin-top: 0.35rem;
+    opacity: 0.85;
+  }
+  .kpi-delta { font-size: 0.78rem; font-weight: 600; }
+  .kpi-delta.up { color: #86efac; }
+  .kpi-delta.down { color: #fca5a5; }
+  .kpi-card.light .kpi-delta.up { color: #16a34a; }
+  .kpi-card.light .kpi-delta.down { color: #dc2626; }
+  .kpi-delta.neutral { opacity: 0.7; }
+  div[data-testid="stTabs"] button[data-baseweb="tab"] {
+    font-weight: 600 !important;
+  }
+  [data-testid="stAppViewContainer"] button[data-testid="baseButton-primary"][kind="primary"] {
+    background-color: #2563eb !important;
+    color: #fff !important;
+  }
+  [data-testid="stAppViewContainer"] button[data-testid="baseButton-primary"][kind="primary"]:hover {
+    background-color: #1d4ed8 !important;
+  }
+  .year-range-hint {
+    font-size: 0.8rem;
+    color: var(--w-body);
+    margin: -0.25rem 0 0.75rem 0;
+    padding: 0.35rem 0.5rem;
+    background: color-mix(in srgb, var(--w-canvas) 70%, transparent);
+    border-radius: var(--w-radius-sm);
+  }
+  .kpi-grid-row {
+    align-items: stretch !important;
+  }
+  .kpi-grid-row > div[data-testid="column"] {
+    display: flex !important;
+    flex-direction: column !important;
+  }
+  .kpi-grid-row > div[data-testid="column"] > div {
+    flex: 1 1 auto !important;
+    width: 100% !important;
+  }
+  .kpi-card.green.watch-display {
+    margin-bottom: 0 !important;
+    cursor: pointer;
+  }
+  .kpi-card.green.watch-display.selected {
+    box-shadow: 0 0 0 3px rgba(159, 232, 112, 0.85);
+  }
+  .kpi-card.green .kpi-value.watch-alert {
+    color: #b91c1c;
+  }
+  .kpi-card.green .kpi-delta.watch-hint {
+    color: #7f1d1d;
+    opacity: 0.9;
+  }
+  div[data-testid="stHorizontalBlock"]:has(.watch-display) {
+    align-items: stretch !important;
+  }
+  div[data-testid="stHorizontalBlock"]:has(.watch-display) > div[data-testid="column"] {
+    align-self: stretch !important;
+  }
+  div[data-testid="column"]:has(.watch-display) [data-testid="stVerticalBlock"] {
+    position: relative !important;
+    gap: 0 !important;
+    height: 100% !important;
+  }
+  div[data-testid="column"]:has(.watch-display) [data-testid="stVerticalBlock"] > [data-testid="stElementContainer"]:last-child {
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    width: 100% !important;
+    height: 0 !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    z-index: 5;
+  }
+  div[data-testid="column"]:has(.watch-display) [data-testid="stButton"] {
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    height: 100% !important;
+    width: 100% !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+  }
+  div[data-testid="column"]:has(.watch-display) [data-testid="stButton"] > button {
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    opacity: 0 !important;
+    cursor: pointer !important;
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    min-height: 0 !important;
+  }
+  div[data-testid="column"]:has(.watch-display) [data-testid="stButton"] > button:focus {
+    outline: none !important;
+    box-shadow: none !important;
+  }
+  div[data-testid="column"]:has(.watch-display) [data-testid="stButton"] p,
+  div[data-testid="column"]:has(.watch-display) [data-testid="stButton"] [data-testid="stMarkdownContainer"] {
+    display: none !important;
+    height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 0 !important;
+  }
+  .watch-detail-table {
+    background: var(--w-canvas);
+    border-radius: var(--w-radius-md);
+    border: 1px solid color-mix(in srgb, var(--w-ink) 10%, transparent);
+    padding: 0.5rem 0;
+    margin-top: 0.5rem;
+  }
+  .watch-detail-table table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+  .watch-detail-table th,
+  .watch-detail-table td {
+    padding: 0.55rem 0.65rem;
+    border-bottom: 1px solid rgba(14,15,12,0.08);
+    text-align: right;
+  }
+  .watch-detail-table th:first-child,
+  .watch-detail-table td:first-child,
+  .watch-detail-table th:nth-child(2),
+  .watch-detail-table td:nth-child(2) {
+    text-align: left;
+  }
+  .watch-detail-table th {
+    font-weight: 700;
+    color: var(--w-ink);
+    background: rgba(255,255,255,0.6);
+  }
 </style>
 """
 
@@ -565,18 +1058,24 @@ def resolve_customer_code(df: pd.DataFrame, question: str) -> str | None:
 
 
 def resolve_factory_code(df: pd.DataFrame, question: str) -> str | None:
-    for f in sorted(df[FACTORY_COL].dropna().astype(str).unique(), key=len, reverse=True):
+    factories = {str(x) for x in df[FACTORY_COL].dropna().unique()}
+    for f in sorted(factories, key=len, reverse=True):
         if f and f in question:
             return f
+    m = re.search(r"\b(M\d{2})\b", question, re.I)
+    if m:
+        cand = m.group(1).upper()
+        if cand in factories:
+            return cand
     m = re.search(r"공장\s*([ABC])", question, re.I)
     if m:
         cand = f"공장{m.group(1).upper()}"
-        if cand in set(df[FACTORY_COL].unique()):
+        if cand in factories:
             return cand
     m = re.search(r"([ABC])\s*공장", question, re.I)
     if m:
         cand = f"공장{m.group(1).upper()}"
-        if cand in set(df[FACTORY_COL].unique()):
+        if cand in factories:
             return cand
     return None
 
@@ -857,6 +1356,273 @@ def answer_from_pl_data(df: pd.DataFrame, question: str) -> str:
         "확인 불가: 제공된 손익 데이터와 질문 형식만으로는 답변을 도출할 수 없습니다. "
         "연도·공장·매출처·품목 코드(예: 품목_18)를 포함해 질문해 주세요."
     )
+
+
+def _init_default_filters(df: pd.DataFrame) -> None:
+    years = sorted(df[YEAR_COL].dropna().astype(int).unique().tolist())
+    if st.session_state.flt_year is None:
+        st.session_state.flt_year = years[-1] if years else 2025
+    if st.session_state.flt_factories is None:
+        st.session_state.flt_factories = []
+    if st.session_state.flt_customers is None:
+        st.session_state.flt_customers = []
+    if st.session_state.flt_items is None:
+        st.session_state.flt_items = []
+
+
+def render_global_filters(df: pd.DataFrame) -> tuple[int, list[str] | None, list[str] | None, list[str] | None]:
+    """글로벌 필터 패널 — 조회 적용 시 AND 조건 반영."""
+    _init_default_filters(df)
+    years = sorted(df[YEAR_COL].dropna().astype(int).unique().tolist())
+    inject_multiselect_autoclose_js()
+
+    st.markdown('<div class="filter-panel">', unsafe_allow_html=True)
+    st.markdown("#### 글로벌 필터")
+
+    year = st.selectbox(
+        "YEAR(기준연도)",
+        options=years,
+        index=years.index(st.session_state.flt_year) if st.session_state.flt_year in years else len(years) - 1,
+        format_func=lambda y: f"{int(y)}년",
+        key="widget_year",
+    )
+    y_int = int(year)
+    fac_options = filter_factory_options(df, y_int)
+    fac_sel = st.multiselect(
+        "FACTORY (공장)",
+        options=fac_options,
+        default=_sanitize_multiselect(st.session_state.flt_factories, fac_options),
+        placeholder="전체 (M10, M20, M30)" if fac_options else "해당 연도 공장 없음",
+        key="widget_factory",
+    )
+    fac_active = fac_sel or None
+
+    cust_options = filter_customer_options(df, y_int, fac_active)
+    cust_sel = st.multiselect(
+        "CUSTOMER (고객)",
+        options=cust_options,
+        default=_sanitize_multiselect(st.session_state.flt_customers, cust_options),
+        placeholder=f"전체 ({len(cust_options)}개 사)" if cust_options else "선택 가능한 고객 없음",
+        key="widget_customer",
+    )
+    cust_active = cust_sel or None
+
+    item_options = filter_item_options(df, y_int, fac_active, cust_active)
+
+    def _item_label(code: str) -> str:
+        s = str(code)
+        return f"…{s[-8:]}" if len(s) > 10 else s
+
+    item_sel = st.multiselect(
+        "ITEM (품목)",
+        options=item_options,
+        default=_sanitize_multiselect(st.session_state.flt_items, item_options),
+        placeholder=f"전체 ({len(item_options)}개 품목)" if item_options else "선택 가능한 품목 없음",
+        format_func=_item_label,
+        key="widget_item",
+    )
+
+    if st.button("조회 적용", type="primary", use_container_width=True, key="btn_apply_filters"):
+        st.session_state.flt_year = y_int
+        st.session_state.flt_factories = list(fac_sel)
+        st.session_state.flt_customers = list(cust_sel)
+        st.session_state.flt_items = list(item_sel)
+        st.session_state.filters_applied = True
+        st.session_state.watch_detail_open = False
+        st.rerun()
+
+    applied_year = int(st.session_state.flt_year)
+    applied_fac = st.session_state.flt_factories or None
+    applied_cust = st.session_state.flt_customers or None
+    applied_item = st.session_state.flt_items or None
+
+    y_start, y_end = trend_year_bounds(applied_year)
+    st.markdown(
+        f"<p class='year-range-hint'>표시 구간: <strong>{html_module.escape(trend_year_label(y_start, y_end))}</strong></p>",
+        unsafe_allow_html=True,
+    )
+
+    alerts = detect_anomalies(apply_scope_filters(df, applied_fac, applied_cust, applied_item))
+    if alerts:
+        st.markdown(
+            f"<div class='anomaly-box'><strong>AI 알림 (ANOMALY)</strong><br/>"
+            f"{html_module.escape(alerts[0])}</div>",
+            unsafe_allow_html=True,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    return applied_year, applied_fac, applied_cust, applied_item
+
+
+def _toggle_watch_detail() -> None:
+    st.session_state.watch_detail_open = not st.session_state.get("watch_detail_open", False)
+
+
+def render_watch_toggle_card(count: int) -> None:
+    """요주의 품목 KPI — 2행 녹색 카드, 카드 전체 클릭 시 하단 상세/차트 토글."""
+    selected = bool(st.session_state.get("watch_detail_open", False))
+    sel_cls = " selected" if selected else ""
+    st.markdown(
+        f'<div class="kpi-card green watch-display{sel_cls}">'
+        f'<div class="kpi-label">요주의 품목 수</div>'
+        f'<div class="kpi-value watch-alert">{count} 개</div>'
+        f'<span class="kpi-delta neutral watch-hint">적자 또는 이익률 5% 미만</span>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    st.button(
+        "\u200b",
+        key="btn_watch_toggle",
+        on_click=_toggle_watch_detail,
+        help="클릭하여 상세 목록 표시/숨기기",
+        use_container_width=True,
+    )
+
+
+def render_watch_detail_table(rows: pd.DataFrame) -> None:
+    if rows.empty:
+        st.info("요주의 품목이 없습니다.")
+        return
+    head = "".join(f"<th>{html_module.escape(c)}</th>" for c in rows.columns)
+    body_parts = []
+    for _, r in rows.iterrows():
+        cells = "".join(f"<td>{html_module.escape(str(r[c]))}</td>" for c in rows.columns)
+        body_parts.append(f"<tr>{cells}</tr>")
+    html = (
+        "<div class='watch-detail-table'>"
+        f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_parts)}</tbody></table>"
+        "</div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def render_kpi_card(label: str, value: str, delta_html: str, *, variant: str = "blue", sub: str = "") -> None:
+    cls = "kpi-card" if variant == "blue" else f"kpi-card {variant}"
+    sub_html = f"<div class='kpi-sub'>{html_module.escape(sub)}</div>" if sub else ""
+    st.markdown(
+        f"<div class='{cls}'>"
+        f"<div class='kpi-label'>{html_module.escape(label)}</div>"
+        f"<div class='kpi-value'>{html_module.escape(value)}</div>"
+        f"{delta_html}{sub_html}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def executive_dashboard(
+    df: pd.DataFrame,
+    year: int,
+    factories: list[str] | None,
+    customers: list[str] | None,
+    items: list[str] | None,
+) -> None:
+    scoped = apply_scope_filters(df, factories, customers, items)
+    curr = aggregate_year_metrics(scoped, year)
+    prev = aggregate_year_metrics(scoped, year - 1)
+
+    sales_yoy = yoy_pct(curr["매출액"], prev["매출액"])
+    contrib_yoy = yoy_pct(curr["공헌이익"], prev["공헌이익"])
+    margin_pp = curr["공헌이익률"] - prev["공헌이익률"] if prev["매출액"] else None
+    op_yoy = yoy_pct(curr["영업이익"], prev["영업이익"])
+    op_margin_pp = curr["영업이익률"] - prev["영업이익률"] if prev["매출액"] else None
+    watch_n = count_watch_items(scoped, year)
+
+    if op_margin_pp is not None:
+        op_delta = (
+            f"<span class='kpi-delta {'down' if op_margin_pp < 0 else 'up'}'>"
+            f"{'▼' if op_margin_pp < 0 else '▲'} {abs(op_margin_pp):.1f}%p YoY</span>"
+        )
+    else:
+        op_delta = kpi_delta_html(None)
+    if margin_pp is not None:
+        margin_delta = (
+            f"<span class='kpi-delta {'down' if margin_pp < 0 else 'up'}'>"
+            f"{'▼' if margin_pp < 0 else '▲'} {abs(margin_pp):.1f}%p YoY</span>"
+        )
+    else:
+        margin_delta = kpi_delta_html(None)
+
+    st.markdown('<div class="kpi-grid-row">', unsafe_allow_html=True)
+    r1a, r1b, r1c = st.columns(3)
+    with r1a:
+        render_kpi_card("총 매출액 (억)", fmt_eok(curr["매출액"]), kpi_delta_html(sales_yoy))
+    with r1b:
+        render_kpi_card("총 영업이익 (억)", fmt_eok(curr["영업이익"]), kpi_delta_html(op_yoy))
+    with r1c:
+        render_kpi_card("영업이익률", f"{curr['영업이익률']:.1f}%", op_delta)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="kpi-grid-row">', unsafe_allow_html=True)
+    r2a, r2b, r2c = st.columns(3)
+    with r2a:
+        render_watch_toggle_card(watch_n)
+    with r2b:
+        render_kpi_card("총 공헌이익 (억)", fmt_eok(curr["공헌이익"]), kpi_delta_html(contrib_yoy), variant="green")
+    with r2c:
+        render_kpi_card("공헌이익률", f"{curr['공헌이익률']:.1f}%", margin_delta, variant="green")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    y_start, y_end = trend_year_bounds(year)
+    trend = (
+        scoped.groupby(YEAR_COL, as_index=False)
+        .agg(매출액=("매출액", "sum"), 공헌이익=("공헌이익", "sum"))
+        .sort_values(YEAR_COL)
+    )
+    trend = trend[(trend[YEAR_COL] >= y_start) & (trend[YEAR_COL] <= y_end)]
+
+    scope_txt = "전사"
+    if factories:
+        scope_txt = ", ".join(factories)
+    elif customers:
+        scope_txt = "선택 고객"
+    elif items:
+        scope_txt = "선택 품목"
+
+    chart_title = f"연도별 매출 및 공헌이익률 추이 ({scope_txt}, {trend_year_label(y_start, y_end)})"
+
+    if st.session_state.get("watch_detail_open", False):
+        st.markdown(f"**요주의 품목 상세** · {year}년 · 적자 또는 영업이익율 5% 미만")
+        render_watch_detail_table(watch_item_detail_rows(scoped, year))
+    else:
+        st.plotly_chart(
+            revenue_contribution_figure(trend, chart_title),
+            use_container_width=True,
+            key="pl_exec_trend",
+        )
+
+
+def analyst_dashboard(
+    df: pd.DataFrame,
+    year: int,
+    factories: list[str] | None,
+    customers: list[str] | None,
+    items: list[str] | None,
+) -> None:
+    scoped = apply_global_filters(df, year, factories, customers, items)
+    st.caption(f"{year}년 · 필터 동시 적용 결과 {len(scoped):,}건")
+
+    summary = (
+        scoped.groupby([FACTORY_COL, CUSTOMER_COL, ITEM_COL], as_index=False)
+        .agg(
+            매출수량=("매출수량", "sum"),
+            매출액=("매출액", "sum"),
+            공헌이익=("공헌이익", "sum"),
+            영업이익=("영업이익", "sum"),
+        )
+        .sort_values("매출액", ascending=False)
+    )
+    summary["공헌이익률(%)"] = (
+        (summary["공헌이익"] / summary["매출액"].replace(0, pd.NA) * 100).round(2)
+    )
+    disp = summary.copy()
+    for c in ("매출액", "공헌이익", "영업이익"):
+        disp[c] = (disp[c] / EOK).round(2)
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    st.markdown("**원가 세부 (억 원, 상위 50)**")
+    cost_y = scoped.groupby([FACTORY_COL, ITEM_COL], as_index=False)[COST_DETAIL_COLS].sum(numeric_only=True)
+    sales_g = scoped.groupby([FACTORY_COL, ITEM_COL], as_index=False)["매출액"].sum()
+    cost_y = cost_y.merge(sales_g, on=[FACTORY_COL, ITEM_COL], how="left").sort_values("매출액", ascending=False)
+    st.dataframe(df_to_eok_display(cost_y.head(50), COST_DETAIL_COLS), use_container_width=True, hide_index=True)
 
 
 def render_top_nav() -> None:
@@ -1393,9 +2159,12 @@ VLM_MODEL_NAME = "My_Model"
 
 
 def main() -> None:
-    st.set_page_config(page_title="손익분석 시스템", layout="wide", initial_sidebar_state="collapsed")
+    st.set_page_config(
+        page_title="AI 기반 원가데이터 분석",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     init_session_state()
-    # 좌·우 분할 영역만 고정 높이 안에서 각각 스크롤 (Streamlit 내장 스크롤)
     _split_h = min(920, max(520, int(st.session_state.get("_split_px", 820))))
     st.markdown(wise_streamlit_css(), unsafe_allow_html=True)
 
@@ -1403,7 +2172,7 @@ def main() -> None:
         st.error(f"데이터 파일을 찾을 수 없습니다: {DATA_PATH}")
         st.stop()
 
-    df = cached_data()
+    df = with_contribution(cached_data())
 
     vb, vm, _ = get_vlm_config()
     if vb and vm and not openai_available():
@@ -1412,19 +2181,33 @@ def main() -> None:
             f"터미널에서 실행: `{sys.executable} -m pip install openai` 후 앱을 다시 실행하세요."
         )
 
-    render_top_nav()
+    st.markdown('<div class="app-title-top-spacer" aria-hidden="true"></div>', unsafe_allow_html=True)
+    st.title("AI 기반 원가데이터 분석 모니터링")
 
-    left, right = st.columns([7, 3], gap="medium")
-    with left:
-        with st.container(height=_split_h, border=False):
-            if st.session_state.nav_tab == "factory":
-                factory_dashboard(df)
-            else:
-                customer_dashboard(df)
+    col_filter, col_main, col_chat = st.columns([2.2, 4.8, 3], gap="medium")
 
-    with right:
+    with col_filter:
+        st.markdown('<div class="filter-col-wrap">', unsafe_allow_html=True)
         with st.container(height=_split_h, border=False):
-            chat_panel(df)
+            year, factories, customers, items = render_global_filters(df)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    filtered_df = apply_global_filters(df, year, factories, customers, items)
+    trend_df = apply_scope_filters(df, factories, customers, items)
+
+    with col_main:
+        with st.container(height=_split_h, border=False):
+            tab_exec, tab_analyst = st.tabs(
+                ["경영진 대시보드형 (Top-Down)", "데이터 분석가형 (Bottom-Up)"]
+            )
+            with tab_exec:
+                executive_dashboard(trend_df, year, factories, customers, items)
+            with tab_analyst:
+                analyst_dashboard(df, year, factories, customers, items)
+
+    with col_chat:
+        with st.container(height=_split_h, border=False):
+            chat_panel(filtered_df)
 
 
 if __name__ == "__main__":
